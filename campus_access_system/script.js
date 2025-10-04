@@ -1,448 +1,375 @@
-class SmartCampusSystem {
-    constructor() {
-        this.isRunning = false;
-        this.currentPhase = 1;
-        this.personType = 'unknown';
-        this.accessGranted = false;
-        this.demoInterval = null;
-        this.phaseTimeouts = [];
-        
-        this.initializeEventListeners();
-        this.updateTime();
-        this.initializeSystem();
-    }
+/* =======================
+   Teachable Machine Scanner
+   ======================= */
+class TMScanner {
+  /**
+   * @param {Object} cfg
+   *  - canvas: HTMLCanvasElement
+   *  - topLeftEl: HTMLElement (overlay for top class + %)
+   *  - bottomLeftEl: HTMLElement (overlay container with <ul class="pred-list">)
+   *  - modelPath: string (directory with model.json + metadata.json)
+   *  - facingMode: 'user'|'environment'
+   *  - onLock: (lockInfo)=>void   lockInfo = { className, prob, timestamp }
+   */
+  constructor(cfg) {
+    this.canvas = cfg.canvas;
+    this.ctx = this.canvas.getContext('2d');
+    this.topLeftEl = cfg.topLeftEl;
+    this.bottomLeftEl = cfg.bottomLeftEl;
+    this.modelPath = cfg.modelPath;
+    this.facingMode = cfg.facingMode || 'user';
+    this.onLock = cfg.onLock || (() => {});
 
-    initializeEventListeners() {
-        document.getElementById('start-demo').addEventListener('click', () => this.startDemo());
-        document.getElementById('reset-demo').addEventListener('click', () => this.resetDemo());
-        document.getElementById('simulate-student').addEventListener('click', () => this.simulateStudent());
-        document.getElementById('simulate-teacher').addEventListener('click', () => this.simulateTeacher());
-        
-        setInterval(() => this.updateTime(), 1000);
-    }
+    // runtime state
+    this.model = null;
+    this.predLoopId = null;
+    this.webcam = null;
+    this.isRunning = false;
 
-    updateTime() {
-        const now = new Date();
-        const timeString = now.toLocaleTimeString();
-        document.getElementById('current-time').textContent = timeString;
-    }
+    // stability tracking
+    this.threshold = 0.98; // >= 98%
+    this.stableWindowMs = 1000; // 1s continuous
+    this.lastTop = null; // { name, prob, since }
+    this.locked = false;
+  }
 
-    initializeSystem() {
-        this.addLog('🚀 SmartCampus Access System Initialized', 'system');
-        this.addLog('💡 Click "Start Demo" to begin the interactive demonstration', 'system');
-        this.updateUI();
-    }
+  async loadModel() {
+    this.model = await tmImage.load(
+      this.modelPath + 'model.json',
+      this.modelPath + 'metadata.json'
+    );
+  }
 
-    startDemo() {
-        if (this.isRunning) return;
-        
-        this.isRunning = true;
-        this.addLog('🎬 Live demo session started', 'system');
-        this.addLog('🔍 Phase 1: Scanning for identity straps...', 'system');
-        this.updateUI();
-        
-        this.runDemoSequence();
-    }
+  async start() {
+    if (!this.model) await this.loadModel();
 
-    resetDemo() {
-        this.isRunning = false;
-        this.currentPhase = 1;
-        this.personType = 'unknown';
-        this.accessGranted = false;
-        
-        // Clear all timeouts
-        this.phaseTimeouts.forEach(timeout => clearTimeout(timeout));
-        this.phaseTimeouts = [];
-        
-        if (this.demoInterval) {
-            clearInterval(this.demoInterval);
+    // init webcam to canvas size
+    const w = this.canvas.width;
+    const h = this.canvas.height;
+    this.webcam = new tmImage.Webcam(w, h, false);
+    await this.webcam.setup({ facingMode: this.facingMode });
+    await this.webcam.play();
+    this.isRunning = true;
+    this.locked = false;
+    this.lastTop = null;
+
+    this.loop();
+  }
+
+  stop() {
+    this.isRunning = false;
+    if (this.predLoopId) cancelAnimationFrame(this.predLoopId);
+    if (this.webcam) {
+      try { this.webcam.stop(); } catch (e) {}
+    }
+  }
+
+  freezeOverlay(message) {
+    if (this.topLeftEl) {
+      this.topLeftEl.textContent = `✅ Locked: ${message}`;
+    }
+  }
+
+  async loop() {
+    if (!this.isRunning) return;
+
+    this.webcam.update();
+    // draw webcam frame into our canvas
+    this.ctx.drawImage(this.webcam.canvas, 0, 0, this.canvas.width, this.canvas.height);
+
+    // predict
+    const preds = await this.model.predict(this.webcam.canvas);
+    preds.sort((a, b) => b.probability - a.probability);
+
+    const top = preds[0];
+    const topName = top.className;
+    const topProb = top.probability;
+
+    // overlays
+    if (this.topLeftEl) {
+      this.topLeftEl.textContent = `${topName} • ${(topProb * 100).toFixed(1)}%`;
+    }
+    if (this.bottomLeftEl) {
+      const ul = this.bottomLeftEl.querySelector('.pred-list');
+      if (ul) {
+        ul.innerHTML = '';
+        for (let i = 0; i < Math.min(3, preds.length); i++) {
+          const li = document.createElement('li');
+          const p = (preds[i].probability * 100).toFixed(1);
+          li.innerHTML = `<span>${preds[i].className}</span><span>${p}%</span>`;
+          ul.appendChild(li);
         }
-        
-        this.addLog('🔄 System reset - Ready for new demonstration', 'system');
-        this.updateUI();
-        this.resetPhaseUI();
+      }
     }
 
-    simulateStudent() {
-        if (!this.isRunning) {
-            this.showNotification('Please start the demo first!', 'warning');
-            return;
-        }
-        
-        if (this.currentPhase !== 1) {
-            this.showNotification('Strap detection phase completed!', 'info');
-            return;
-        }
-        
-        this.personType = 'student';
-        this.addLog('🎓 Student identified - Purple strap detected', 'student');
-        this.addLog('✅ Phase 1 completed: Student verification successful', 'success');
-        this.advanceToNextPhase();
+    // stability / lock
+    const now = performance.now();
+    if (!this.lastTop || this.lastTop.name !== topName || topProb < this.threshold) {
+      if (topProb >= this.threshold) {
+        this.lastTop = { name: topName, since: now, prob: topProb };
+      } else {
+        this.lastTop = null;
+      }
+    } else {
+      if (now - this.lastTop.since >= this.stableWindowMs) {
+        this.locked = true;
+        this.stop();
+        this.freezeOverlay(topName);
+        this.onLock({ className: topName, prob: topProb, timestamp: new Date() });
+        return;
+      }
     }
 
-    simulateTeacher() {
-        if (!this.isRunning) {
-            this.showNotification('Please start the demo first!', 'warning');
-            return;
-        }
-        
-        if (this.currentPhase !== 1) {
-            this.showNotification('Strap detection phase completed!', 'info');
-            return;
-        }
-        
-        this.personType = 'teacher';
-        this.addLog('👨‍🏫 Teacher identified - Blue strap detected', 'teacher');
-        this.addLog('✅ Phase 1 completed: Teacher verification successful', 'success');
-        this.advanceToNextPhase();
-    }
-
-    runDemoSequence() {
-        // Reset to phase 1
-        this.currentPhase = 1;
-        this.updateUI();
-        
-        this.addLog('🔍 Phase 1: Scanning for identity straps...', 'system');
-        this.updatePhaseDisplay('Phase 1: Strap Detection', 'Show purple strap for Student, blue for Teacher');
-        
-        // Auto-advance demonstration
-        this.demoInterval = setInterval(() => {
-            if (!this.isRunning) return;
-            
-            if (this.currentPhase === 1 && this.personType === 'unknown') {
-                // Still waiting for strap detection
-                this.updateDetectionBox('🔍');
-            }
-            else if (this.currentPhase === 2) {
-                // Phase 2: ID Verification
-                this.simulateIDVerification();
-            }
-            else if (this.currentPhase === 3) {
-                // Phase 3: Vehicle Detection
-                this.simulateVehicleDetection();
-            }
-        }, 2000);
-    }
-
-    advanceToNextPhase() {
-        if (this.currentPhase === 1 && this.personType !== 'unknown') {
-            // Move to Phase 2
-            this.currentPhase = 2;
-            this.addLog(`✅ Phase 1: ${this.personType} identified - Moving to ID verification`, 'success');
-            this.updateUI();
-            this.simulateIDVerification();
-        }
-    }
-
-    simulateIDVerification() {
-        this.updatePhaseDisplay('Phase 2: ID Verification', 'Face detected - Verifying with database...');
-        this.updateDetectionBox('📷');
-        
-        // Simulate face detection and verification
-        const timeout = setTimeout(() => {
-            if (this.isRunning && this.currentPhase === 2) {
-                this.addLog('✅ ID verified successfully - Face matches database records', 'success');
-                this.currentPhase = 3;
-                this.updateUI();
-                this.simulateVehicleDetection();
-            }
-        }, 3000);
-        
-        this.phaseTimeouts.push(timeout);
-    }
-
-    simulateVehicleDetection() {
-        this.updatePhaseDisplay('Phase 3: Vehicle Detection', 'Scanning for license plate...');
-        this.updateDetectionBox('🚗');
-        
-        // Simulate vehicle detection
-        const timeout1 = setTimeout(() => {
-            if (this.isRunning && this.currentPhase === 3) {
-                const vehicleNumber = this.personType === 'student' ? 'STU001' : 'TCH001';
-                this.addLog(`✅ Vehicle detected: ${vehicleNumber} - Checking authorization...`, 'success');
-                
-                const timeout2 = setTimeout(() => {
-                    if (this.isRunning) {
-                        this.accessGranted = true;
-                        this.addLog(`🎉 ACCESS GRANTED: ${this.personType} with vehicle ${vehicleNumber}`, 'success');
-                        this.updateUI();
-                        this.showAccessGranted();
-                        this.showSuccessModal();
-                    }
-                }, 2000);
-                
-                this.phaseTimeouts.push(timeout2);
-            }
-        }, 3000);
-        
-        this.phaseTimeouts.push(timeout1);
-    }
-
-    updatePhaseDisplay(phaseText, statusText) {
-        const phaseIndicator = document.getElementById('phase-indicator');
-        phaseIndicator.innerHTML = `
-            <span class="phase-badge">Phase ${this.currentPhase}</span>
-            <span class="phase-text">${phaseText}</span>
-        `;
-        
-        // Update status overlay in camera feed
-        const statusElements = document.querySelectorAll('.status-overlay');
-        statusElements.forEach(element => {
-            element.textContent = statusText;
-        });
-    }
-
-    updateDetectionBox(emoji) {
-        const detectionBox = document.querySelector('.detection-box');
-        if (detectionBox) {
-            detectionBox.textContent = emoji;
-            detectionBox.style.borderColor = '#fff';
-            detectionBox.style.animation = 'pulse 2s infinite';
-        }
-    }
-
-    showAccessGranted() {
-        const detectionBox = document.querySelector('.detection-box');
-        if (detectionBox) {
-            detectionBox.textContent = '✅';
-            detectionBox.style.borderColor = '#10b981';
-            detectionBox.style.background = 'rgba(16, 185, 129, 0.2)';
-            detectionBox.classList.add('success-glow');
-        }
-        
-        this.updatePhaseDisplay('ACCESS GRANTED!', 'Welcome to Campus! 🎉');
-    }
-
-    showSuccessModal() {
-        const modal = document.getElementById('success-modal');
-        if (modal) {
-            modal.style.display = 'block';
-        }
-    }
-
-    showNotification(message, type = 'info') {
-        // Create a temporary notification
-        const notification = document.createElement('div');
-        notification.style.cssText = `
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            padding: 1rem 1.5rem;
-            background: ${type === 'warning' ? '#f59e0b' : '#6366f1'};
-            color: white;
-            border-radius: 10px;
-            z-index: 3000;
-            font-weight: 600;
-            box-shadow: 0 8px 32px rgba(0,0,0,0.3);
-            animation: slideIn 0.3s ease;
-        `;
-        notification.textContent = message;
-        
-        document.body.appendChild(notification);
-        
-        setTimeout(() => {
-            notification.remove();
-        }, 3000);
-    }
-
-    updateUI() {
-        // Update phase display
-        const phaseText = this.getPhaseText();
-        document.getElementById('current-phase').textContent = phaseText;
-        
-        // Update person type
-        const personTypeElement = document.getElementById('person-type');
-        personTypeElement.textContent = this.personType.charAt(0).toUpperCase() + this.personType.slice(1);
-        
-        // Update access status
-        const accessStatus = document.getElementById('access-status');
-        if (this.accessGranted) {
-            accessStatus.textContent = 'ACCESS GRANTED 🎉';
-            accessStatus.className = 'status-value access-status';
-            accessStatus.style.background = '#10b981';
-        } else {
-            accessStatus.textContent = this.currentPhase === 1 ? 'Waiting for strap...' : 'Processing...';
-            accessStatus.className = 'status-value access-status';
-            accessStatus.style.background = '#f59e0b';
-        }
-        
-        // Update phase progress
-        this.updatePhaseProgress();
-        
-        // Update demo controls
-        this.updateDemoControls();
-    }
-
-    getPhaseText() {
-        switch(this.currentPhase) {
-            case 1: return '1 - Strap Detection';
-            case 2: return '2 - ID Verification';
-            case 3: return '3 - Vehicle Detection';
-            default: return '1 - Strap Detection';
-        }
-    }
-
-    updatePhaseProgress() {
-        // Reset all steps
-        document.getElementById('step-1').classList.remove('active', 'completed');
-        document.getElementById('step-2').classList.remove('active', 'completed');
-        document.getElementById('step-3').classList.remove('active', 'completed');
-        
-        // Update step 1
-        const step1 = document.getElementById('step-1');
-        const step1Status = document.getElementById('step1-status');
-        
-        if (this.currentPhase >= 1) {
-            if (this.currentPhase > 1) {
-                step1.classList.add('completed');
-                step1Status.innerHTML = '<i class="fas fa-check"></i> Completed';
-            } else {
-                step1.classList.add('active');
-                step1Status.innerHTML = this.personType !== 'unknown' ? 
-                    '<i class="fas fa-check"></i> Identified' : 
-                    '<i class="fas fa-search"></i> Scanning...';
-            }
-        }
-        
-        // Update step 2
-        const step2 = document.getElementById('step-2');
-        const step2Status = document.getElementById('step2-status');
-        
-        if (this.currentPhase >= 2) {
-            if (this.currentPhase > 2) {
-                step2.classList.add('completed');
-                step2Status.innerHTML = '<i class="fas fa-check"></i> Verified';
-            } else {
-                step2.classList.add('active');
-                step2Status.innerHTML = '<i class="fas fa-camera"></i> Verifying...';
-            }
-        }
-        
-        // Update step 3
-        const step3 = document.getElementById('step-3');
-        const step3Status = document.getElementById('step3-status');
-        
-        if (this.currentPhase >= 3) {
-            step3.classList.add('active');
-            if (this.accessGranted) {
-                step3Status.innerHTML = '<i class="fas fa-check"></i> Access Granted';
-                step3.classList.add('completed');
-            } else {
-                step3Status.innerHTML = '<i class="fas fa-car"></i> Scanning vehicle...';
-            }
-        }
-    }
-
-    resetPhaseUI() {
-        this.updatePhaseDisplay('Phase 1: Strap Detection', 'Show purple strap for Student, blue for Teacher');
-        
-        const detectionBox = document.querySelector('.detection-box');
-        if (detectionBox) {
-            detectionBox.textContent = '';
-            detectionBox.style.borderColor = '#fff';
-            detectionBox.style.background = 'transparent';
-            detectionBox.classList.remove('success-glow');
-            detectionBox.style.animation = 'none';
-        }
-        
-        // Reset phase progress
-        document.getElementById('step-1').classList.remove('active', 'completed');
-        document.getElementById('step-2').classList.remove('active', 'completed');
-        document.getElementById('step-3').classList.remove('active', 'completed');
-        document.getElementById('step-1').classList.add('active');
-        
-        document.getElementById('step1-status').innerHTML = '<i class="fas fa-search"></i> Scanning...';
-        document.getElementById('step2-status').innerHTML = '<i class="fas fa-clock"></i> Waiting';
-        document.getElementById('step3-status').innerHTML = '<i class="fas fa-clock"></i> Waiting';
-    }
-
-    updateDemoControls() {
-        const startBtn = document.getElementById('start-demo');
-        const resetBtn = document.getElementById('reset-demo');
-        const studentBtn = document.getElementById('simulate-student');
-        const teacherBtn = document.getElementById('simulate-teacher');
-        
-        if (this.isRunning) {
-            startBtn.disabled = true;
-            startBtn.style.opacity = '0.6';
-            resetBtn.disabled = false;
-            resetBtn.style.opacity = '1';
-            
-            // Only enable student/teacher buttons in phase 1
-            if (this.currentPhase === 1) {
-                studentBtn.disabled = false;
-                teacherBtn.disabled = false;
-                studentBtn.style.opacity = '1';
-                teacherBtn.style.opacity = '1';
-            } else {
-                studentBtn.disabled = true;
-                teacherBtn.disabled = true;
-                studentBtn.style.opacity = '0.6';
-                teacherBtn.style.opacity = '0.6';
-            }
-        } else {
-            startBtn.disabled = false;
-            startBtn.style.opacity = '1';
-            resetBtn.disabled = true;
-            resetBtn.style.opacity = '0.6';
-            studentBtn.disabled = true;
-            teacherBtn.disabled = true;
-            studentBtn.style.opacity = '0.6';
-            teacherBtn.style.opacity = '0.6';
-        }
-    }
-
-    addLog(message, type = 'system') {
-        const logsContainer = document.getElementById('logs-container');
-        const logEntry = document.createElement('div');
-        logEntry.className = `log-entry ${type}`;
-        
-        const timestamp = new Date().toLocaleTimeString();
-        logEntry.innerHTML = `
-            <span class="timestamp">${timestamp}</span>
-            <span class="message">${message}</span>
-        `;
-        
-        logsContainer.prepend(logEntry);
-        
-        // Keep only last 10 logs
-        const logs = logsContainer.querySelectorAll('.log-entry');
-        if (logs.length > 10) {
-            logs[logs.length - 1].remove();
-        }
-        
-        // Auto-scroll to top
-        logsContainer.scrollTop = 0;
-    }
+    this.predLoopId = requestAnimationFrame(() => this.loop());
+  }
 }
 
-// Global function to close modal
+/* =======================
+   Views / Steps helpers
+   ======================= */
+function show(viewId) {
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+  const el = document.getElementById(viewId);
+  if (el) el.classList.add('active');
+
+  const status = document.getElementById('current-phase');
+  if (status) status.textContent = viewId.replace('view-', '').replace('-', ' ').toUpperCase();
+}
+
+function setStepState(badgeEl, state /* 'pending'|'active'|'done' */) {
+  if (!badgeEl) return;
+  badgeEl.setAttribute('data-state', state);
+  badgeEl.textContent = state === 'pending' ? 'Pending' : state === 'active' ? 'Active' : 'Done';
+}
+
+/* =======================
+   Logs / Misc
+   ======================= */
+function addLog(message, type = 'system') {
+  const logsContainer = document.getElementById('logs-container');
+  if (!logsContainer) return;
+  const logEntry = document.createElement('div');
+  logEntry.className = `log-entry ${type}`;
+  const timestamp = new Date().toLocaleTimeString();
+  logEntry.innerHTML = `<span class="timestamp">${timestamp}</span><span class="message">${message}</span>`;
+  logsContainer.prepend(logEntry);
+  const logs = logsContainer.querySelectorAll('.log-entry');
+  if (logs.length > 10) logs[logs.length - 1].remove();
+  logsContainer.scrollTop = 0;
+}
 function closeModal() {
-    const modal = document.getElementById('success-modal');
-    if (modal) {
-        modal.style.display = 'none';
-    }
+  const modal = document.getElementById('success-modal');
+  if (modal) modal.style.display = 'none';
 }
 
-// Add slideIn animation to CSS
-const style = document.createElement('style');
-style.textContent = `
-    @keyframes slideIn {
-        from {
-            transform: translateX(100%);
-            opacity: 0;
-        }
-        to {
-            transform: translateX(0);
-            opacity: 1;
-        }
-    }
-`;
-document.head.appendChild(style);
+/* =======================
+   DEMO FLOW (3 steps)
+   ======================= */
 
-// Initialize the system when page loads
+let demoFaceScanner, demoIdScanner;
+let lockedFace = null; // { className, prob, timestamp }
+let lockedId = null;
+
+function normalizeName(s) {
+  return (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+function escapeHtml(s) {
+  return String(s).replaceAll('&','&amp;').replaceAll('<','&lt;')
+    .replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#039;');
+}
+function safeStop(scanner) { if (scanner) try { scanner.stop(); } catch(e) {} }
+
+function startDemoFlow() {
+  addLog('🎬 Interactive Demo started.', 'system');
+
+  lockedFace = null; lockedId = null;
+  setStepState(document.getElementById('badge-face'), 'active');
+  setStepState(document.getElementById('badge-id'), 'pending');
+  setStepState(document.getElementById('badge-verify'), 'pending');
+  document.getElementById('verify-status').textContent = 'Waiting for both locks…';
+
+  // FACE SCANNER
+  if (demoFaceScanner) demoFaceScanner.stop();
+  demoFaceScanner = new TMScanner({
+    canvas: document.getElementById('demo-face-canvas'),
+    topLeftEl: document.getElementById('demo-face-topleft'),
+    bottomLeftEl: document.getElementById('demo-face-bottomleft'),
+    modelPath: './tm_model/',            // <-- your face model folder
+    facingMode: 'user',
+    onLock: (info) => {
+      lockedFace = info;
+      setStepState(document.getElementById('badge-face'), 'done');
+      document.getElementById('demo-face-scan-again').style.display = 'inline-flex';
+      setStepState(document.getElementById('badge-id'), 'active');
+      addLog(`✅ Face locked: ${info.className}`, 'success');
+    }
+  });
+  demoFaceScanner.start();
+
+  // ID SCANNER
+  if (demoIdScanner) demoIdScanner.stop();
+  demoIdScanner = new TMScanner({
+    canvas: document.getElementById('demo-id-canvas'),
+    topLeftEl: document.getElementById('demo-id-topleft'),
+    bottomLeftEl: document.getElementById('demo-id-bottomleft'),
+    modelPath: './id/id_model/',         // <-- your ID model folder
+    facingMode: 'environment',
+    onLock: (info) => {
+      lockedId = info;
+      setStepState(document.getElementById('badge-id'), 'done');
+      document.getElementById('demo-id-scan-again').style.display = 'inline-flex';
+      setStepState(document.getElementById('badge-verify'), 'active');
+      addLog(`✅ ID locked: ${info.className}`, 'success');
+    }
+  });
+  demoIdScanner.start();
+
+  // Scan Again buttons
+  document.getElementById('demo-face-scan-again').onclick = () => {
+    lockedFace = null;
+    setStepState(document.getElementById('badge-face'), 'active');
+    document.getElementById('demo-face-scan-again').style.display = 'none';
+    demoFaceScanner.start();
+  };
+  document.getElementById('demo-id-scan-again').onclick = () => {
+    lockedId = null;
+    setStepState(document.getElementById('badge-id'), 'active');
+    document.getElementById('demo-id-scan-again').style.display = 'none';
+    demoIdScanner.start();
+  };
+
+  // Back
+  document.getElementById('btn-demo-back').onclick = () => {
+    safeStop(demoFaceScanner);
+    safeStop(demoIdScanner);
+    show('view-home');
+  };
+
+  // Verify
+  document.getElementById('btn-check-verify').onclick = () => {
+    if (!lockedFace || !lockedId) {
+      document.getElementById('verify-status').textContent = 'Lock both Face and ID first.';
+      return;
+    }
+    const faceName = normalizeName(lockedFace.className);
+    const idName = normalizeName(lockedId.className);
+    if (faceName && idName && faceName === idName) {
+      setStepState(document.getElementById('badge-verify'), 'done');
+      goVerified(faceName);
+    } else {
+      alert('Mismatch! Please rescan ID.');
+      // reset only ID step
+      lockedId = null;
+      document.getElementById('demo-id-scan-again').style.display = 'none';
+      setStepState(document.getElementById('badge-verify'), 'pending');
+      setStepState(document.getElementById('badge-id'), 'active');
+      demoIdScanner.start();
+    }
+  };
+}
+
+function goVerified(name) {
+  safeStop(demoFaceScanner);
+  safeStop(demoIdScanner);
+  document.getElementById('verified-title').textContent = 'Verified';
+  document.getElementById('verified-text').innerHTML = `The person and ID belong to <strong>${escapeHtml(name.toUpperCase())}</strong>`;
+  show('view-verified');
+  addLog(`🎉 Verified: ${name}`, 'success');
+}
+
+/* =======================
+   SOLO FLOWS
+   ======================= */
+let soloFaceScanner, soloIdScanner;
+
+function startSoloFace() {
+  if (soloFaceScanner) soloFaceScanner.stop();
+  document.getElementById('solo-face-scan-again').style.display = 'none';
+
+  soloFaceScanner = new TMScanner({
+    canvas: document.getElementById('solo-face-canvas'),
+    topLeftEl: document.getElementById('solo-face-topleft'),
+    bottomLeftEl: document.getElementById('solo-face-bottomleft'),
+    modelPath: './tm_model/',
+    facingMode: 'user',
+    onLock: (info) => {
+      addLog(`✅ Face locked: ${info.className}`, 'success');
+      document.getElementById('solo-face-scan-again').style.display = 'inline-flex';
+    }
+  });
+  soloFaceScanner.start();
+
+  document.getElementById('solo-face-scan-again').onclick = () => {
+    document.getElementById('solo-face-scan-again').style.display = 'none';
+    soloFaceScanner.start();
+  };
+  document.getElementById('solo-face-back').onclick = () => {
+    safeStop(soloFaceScanner);
+    show('view-home');
+  };
+}
+
+function startSoloId() {
+  if (soloIdScanner) soloIdScanner.stop();
+  document.getElementById('solo-id-scan-again').style.display = 'none';
+
+  soloIdScanner = new TMScanner({
+    canvas: document.getElementById('solo-id-canvas'),
+    topLeftEl: document.getElementById('solo-id-topleft'),
+    bottomLeftEl: document.getElementById('solo-id-bottomleft'),
+    modelPath: './id/id_model/',
+    facingMode: 'environment',
+    onLock: (info) => {
+      addLog(`✅ ID locked: ${info.className}`, 'success');
+      document.getElementById('solo-id-scan-again').style.display = 'inline-flex';
+    }
+  });
+  soloIdScanner.start();
+
+  document.getElementById('solo-id-scan-again').onclick = () => {
+    document.getElementById('solo-id-scan-again').style.display = 'none';
+    soloIdScanner.start();
+  };
+  document.getElementById('solo-id-back').onclick = () => {
+    safeStop(soloIdScanner);
+    show('view-home');
+  };
+}
+
+/* =======================
+   App bootstrap
+   ======================= */
 document.addEventListener('DOMContentLoaded', () => {
-    window.campusSystem = new SmartCampusSystem();
-    console.log('🎓 SmartCampus Access System Loaded!');
-    console.log('💡 Click "Start Demo" to begin the interactive demonstration');
+  // toast animation keyframes for notifications (if you add any)
+  const style = document.createElement('style');
+  style.textContent = `@keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}`;
+  document.head.appendChild(style);
+
+  // clock
+  setInterval(() => {
+    const now = new Date();
+    const t = document.getElementById('current-time');
+    if (t) t.textContent = now.toLocaleTimeString();
+  }, 1000);
+
+  addLog('🚀 App Ready. Choose Demo or Solo mode.', 'system');
+
+  // Home buttons
+  document.getElementById('btn-demo').addEventListener('click', () => {
+    show('view-demo');
+    startDemoFlow();
+  });
+  document.getElementById('btn-face-only').addEventListener('click', () => {
+    show('view-solo-face');
+    startSoloFace();
+  });
+  document.getElementById('btn-id-only').addEventListener('click', () => {
+    show('view-solo-id');
+    startSoloId();
+  });
+
+  // Verified -> Done
+  document.getElementById('btn-verified-done').addEventListener('click', () => {
+    show('view-home');
+  });
 });
