@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Face Scanner</title>
+
+  <!-- TFJS + Teachable Machine -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
+
+  <style>
+    body { font-family: system-ui, sans-serif; display:grid; place-items:center; gap:16px; padding:24px; }
+    #container { position:relative; width:480px; }
+    #label { position:absolute; left:8px; top:8px; background:rgba(0,0,0,.6); color:#fff; padding:8px 10px; border-radius:8px; }
+    #probs { position:absolute; left:8px; bottom:8px; background:rgba(0,0,0,.5); color:#fff; padding:8px 10px; border-radius:8px; font-size:14px; line-height:1.35; white-space:pre; }
+    canvas { width:480px; height:360px; border-radius:12px; }
+    button { padding:10px 14px; border-radius:10px; border:1px solid #ddd; background:#f6f6f6; cursor:pointer; }
+  </style>
+</head>
+<body>
+  <h2>Face Scanner (Teachable Machine)</h2>
+
+  <div id="container">
+    <div id="label">Loading model…</div>
+    <div id="probs"></div>
+    <canvas id="canvas" width="480" height="360"></canvas>
+  </div>
+
+  <div style="display:flex; gap:8px;">
+    <button id="start">Start camera</button>
+    <button id="scanAgain" style="display:none;">Scan Again</button>
+  </div>
+
+  <script>
+    // IMPORTANT: index.html is inside tm_model, so model files are in the SAME folder.
+    const MODEL_URL = "./";              // <-- changed from "tm_model/" to "./"
+    const THRESHOLD = 0.95;
+    const HOLD_TIME_MS = 500;
+
+    let model, webcam, ctx, running = false, locked = false;
+    let stableClass = null, stableStart = 0;
+
+    async function loadModel() {
+      model = await tmImage.load(MODEL_URL + "model.json", MODEL_URL + "metadata.json");
+    }
+
+    async function initWebcam() {
+      webcam = new tmImage.Webcam(360, 360, true);      // mirror/front cam
+      await webcam.setup({ facingMode: "user" });
+      await webcam.play();
+      const canvas = document.getElementById("canvas");
+      ctx = canvas.getContext("2d");
+      running = true; locked = false; stableClass = null; stableStart = 0;
+      requestAnimationFrame(loop);
+    }
+
+    async function loop() {
+      if (!running) return;
+      webcam.update();
+      await predict();
+      if (running) requestAnimationFrame(loop);
+    }
+
+    async function predict() {
+      if (locked) return;
+
+      const canvas = document.getElementById("canvas");
+      ctx.drawImage(webcam.canvas, 0, 0, canvas.width, canvas.height);
+
+      const preds = await model.predict(webcam.canvas);
+      preds.sort((a,b)=>b.probability-a.probability);
+      const top = preds[0];
+
+      document.getElementById("label").textContent =
+        `${top.className}: ${(top.probability*100).toFixed(1)}%`;
+      document.getElementById("probs").textContent =
+        preds.slice(0,3).map(p=>`${p.className}: ${(p.probability*100).toFixed(1)}%`).join("\n");
+
+      const now = Date.now();
+      if (top.probability >= THRESHOLD) {
+        if (stableClass === top.className) {
+          const elapsed = now - stableStart;
+          if (elapsed <= HOLD_TIME_MS) {
+            locked = true; running = false;
+            document.getElementById("label").textContent = `✅ The face shown belongs to ${top.className}`;
+            document.getElementById("probs").textContent = "";
+            webcam.stop();
+            const stream = webcam.webcam?.srcObject; if (stream) stream.getTracks().forEach(t=>t.stop());
+            document.getElementById("scanAgain").style.display = "inline-block";
+          } else {
+            const remain = Math.ceil((HOLD_TIME_MS - elapsed)/100)*100;
+            document.getElementById("label").textContent =
+              `${top.className}: ${(top.probability*100).toFixed(1)}% (locking in ${remain}ms)`;
+          }
+        } else {
+          stableClass = top.className;
+          stableStart = now;
+        }
+      } else {
+        stableClass = null; stableStart = 0;
+      }
+    }
+
+    document.getElementById("start").addEventListener("click", async () => {
+      document.getElementById("start").disabled = true;
+      try {
+        await loadModel();
+        await initWebcam();
+        document.getElementById("label").textContent = "Model ready. Looking...";
+      } catch (e) {
+        document.getElementById("label").textContent = "Error: " + e.message;
+        console.error(e);
+        document.getElementById("start").disabled = false;
+      }
+    });
+
+    document.getElementById("scanAgain").addEventListener("click", async () => {
+      document.getElementById("scanAgain").style.display = "none";
+      await initWebcam();
+      document.getElementById("label").textContent = "Model ready. Looking...";
+    });
+  </script>
+</body>
+</html>

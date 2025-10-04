@@ -1,3 +1,14 @@
+/* =========================================================
+   SmartCampus – Teachable Machine Scanners
+   - Face model  : ./tm_model/
+   - ID model    : ./id_model/
+   ========================================================= */
+
+/* Warn if opened via file:// (fetch + camera blocked) */
+if (location.protocol !== 'http:' && location.protocol !== 'https:') {
+  alert('Please run this site via http(s). Camera & model loading are blocked on file://');
+}
+
 /* =======================
    Teachable Machine Scanner
    ======================= */
@@ -27,33 +38,56 @@ class TMScanner {
     this.isRunning = false;
 
     // stability tracking
-    this.threshold = 0.98; // >= 98%
-    this.stableWindowMs = 1000; // 1s continuous
-    this.lastTop = null; // { name, prob, since }
+    this.threshold = 0.98;        // >= 98%
+    this.stableWindowMs = 1000;   // 1s continuous
+    this.lastTop = null;          // { name, prob, since }
     this.locked = false;
   }
 
+  note(msg)  { if (this.topLeftEl) this.topLeftEl.textContent = msg; }
+  error(msg) { if (this.topLeftEl) this.topLeftEl.textContent = `⚠️ ${msg}`; }
+
   async loadModel() {
-    this.model = await tmImage.load(
-      this.modelPath + 'model.json',
-      this.modelPath + 'metadata.json'
-    );
+    try {
+      this.note(`Loading model…`);
+      this.model = await tmImage.load(
+        this.modelPath + 'model.json',
+        this.modelPath + 'metadata.json'
+      );
+      this.note(`Model ready`);
+    } catch (e) {
+      this.error(`Model load failed (${this.modelPath}). Check path & server.`);
+      console.error('TMScanner model load error:', e);
+      throw e;
+    }
   }
 
   async start() {
-    if (!this.model) await this.loadModel();
+    try {
+      if (!this.model) await this.loadModel();
 
-    // init webcam to canvas size
-    const w = this.canvas.width;
-    const h = this.canvas.height;
-    this.webcam = new tmImage.Webcam(w, h, false);
-    await this.webcam.setup({ facingMode: this.facingMode });
-    await this.webcam.play();
-    this.isRunning = true;
-    this.locked = false;
-    this.lastTop = null;
+      // init webcam with canvas size
+      const w = this.canvas.width;
+      const h = this.canvas.height;
+      this.webcam = new tmImage.Webcam(w, h, false);
+      this.note(`Requesting camera…`);
+      await this.webcam.setup({ facingMode: this.facingMode }); // prompts for permission
+      await this.webcam.play();
 
-    this.loop();
+      this.isRunning = true;
+      this.locked = false;
+      this.lastTop = null;
+      this.note(`Scanning…`);
+      this.loop();
+    } catch (e) {
+      if (e && (e.name === 'NotAllowedError' || e.name === 'NotFoundError')) {
+        this.error('Camera blocked or not found. Allow camera & refresh.');
+      } else {
+        this.error('Failed to start camera. Use http(s) and check permissions.');
+      }
+      console.error('TMScanner start error:', e);
+      throw e;
+    }
   }
 
   stop() {
@@ -65,20 +99,25 @@ class TMScanner {
   }
 
   freezeOverlay(message) {
-    if (this.topLeftEl) {
-      this.topLeftEl.textContent = `✅ Locked: ${message}`;
-    }
+    if (this.topLeftEl) this.topLeftEl.textContent = `✅ Locked: ${message}`;
   }
 
   async loop() {
     if (!this.isRunning) return;
 
     this.webcam.update();
-    // draw webcam frame into our canvas
+    // draw webcam frame to our canvas
     this.ctx.drawImage(this.webcam.canvas, 0, 0, this.canvas.width, this.canvas.height);
 
     // predict
-    const preds = await this.model.predict(this.webcam.canvas);
+    let preds;
+    try {
+      preds = await this.model.predict(this.webcam.canvas);
+    } catch (e) {
+      this.error('Prediction failed (see console).');
+      console.error('Predict error:', e);
+      return;
+    }
     preds.sort((a, b) => b.probability - a.probability);
 
     const top = preds[0];
@@ -105,11 +144,8 @@ class TMScanner {
     // stability / lock
     const now = performance.now();
     if (!this.lastTop || this.lastTop.name !== topName || topProb < this.threshold) {
-      if (topProb >= this.threshold) {
-        this.lastTop = { name: topName, since: now, prob: topProb };
-      } else {
-        this.lastTop = null;
-      }
+      if (topProb >= this.threshold) this.lastTop = { name: topName, since: now, prob: topProb };
+      else this.lastTop = null;
     } else {
       if (now - this.lastTop.since >= this.stableWindowMs) {
         this.locked = true;
@@ -161,94 +197,110 @@ function closeModal() {
   const modal = document.getElementById('success-modal');
   if (modal) modal.style.display = 'none';
 }
+function normalizeName(s){ return (s || '').trim().toLowerCase().replace(/\s+/g, ' '); }
+function escapeHtml(s){
+  return String(s).replaceAll('&','&amp;').replaceAll('<','&lt;')
+    .replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#039;');
+}
+function safeStop(scanner){ if(scanner) try{ scanner.stop(); }catch(e){} }
 
 /* =======================
-   DEMO FLOW (3 steps)
+   DEMO FLOW (Sequential: Face → ID → Verify)
    ======================= */
-
 let demoFaceScanner, demoIdScanner;
 let lockedFace = null; // { className, prob, timestamp }
 let lockedId = null;
 
-function normalizeName(s) {
-  return (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
-}
-function escapeHtml(s) {
-  return String(s).replaceAll('&','&amp;').replaceAll('<','&lt;')
-    .replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#039;');
-}
-function safeStop(scanner) { if (scanner) try { scanner.stop(); } catch(e) {} }
-
 function startDemoFlow() {
   addLog('🎬 Interactive Demo started.', 'system');
 
-  lockedFace = null; lockedId = null;
+  lockedFace = null; 
+  lockedId = null;
+
+  // Reset badges
   setStepState(document.getElementById('badge-face'), 'active');
   setStepState(document.getElementById('badge-id'), 'pending');
   setStepState(document.getElementById('badge-verify'), 'pending');
-  document.getElementById('verify-status').textContent = 'Waiting for both locks…';
+  document.getElementById('verify-status').textContent = 'Waiting for face lock…';
 
-  // FACE SCANNER
+  // Stop any previous scanners
   if (demoFaceScanner) demoFaceScanner.stop();
+  if (demoIdScanner) demoIdScanner.stop();
+
+  // FACE SCANNER starts first
   demoFaceScanner = new TMScanner({
     canvas: document.getElementById('demo-face-canvas'),
     topLeftEl: document.getElementById('demo-face-topleft'),
     bottomLeftEl: document.getElementById('demo-face-bottomleft'),
-    modelPath: './tm_model/',            // <-- your face model folder
+    modelPath: './tm_model/',
     facingMode: 'user',
     onLock: (info) => {
       lockedFace = info;
       setStepState(document.getElementById('badge-face'), 'done');
       document.getElementById('demo-face-scan-again').style.display = 'inline-flex';
-      setStepState(document.getElementById('badge-id'), 'active');
       addLog(`✅ Face locked: ${info.className}`, 'success');
+
+      // 👉 Now start ID step
+      setStepState(document.getElementById('badge-id'), 'active');
+      document.getElementById('verify-status').textContent = 'Face done. Waiting for ID lock…';
+
+      if (demoIdScanner) demoIdScanner.stop();
+      demoIdScanner = new TMScanner({
+        canvas: document.getElementById('demo-id-canvas'),
+        topLeftEl: document.getElementById('demo-id-topleft'),
+        bottomLeftEl: document.getElementById('demo-id-bottomleft'),
+        modelPath: './id_model/',
+        facingMode: 'environment',
+        onLock: (idInfo) => {
+          lockedId = idInfo;
+          setStepState(document.getElementById('badge-id'), 'done');
+          document.getElementById('demo-id-scan-again').style.display = 'inline-flex';
+          setStepState(document.getElementById('badge-verify'), 'active');
+          document.getElementById('verify-status').textContent = 'Ready to verify!';
+          addLog(`✅ ID locked: ${idInfo.className}`, 'success');
+        }
+      });
+      demoIdScanner.start();
     }
   });
   demoFaceScanner.start();
 
-  // ID SCANNER
-  if (demoIdScanner) demoIdScanner.stop();
-  demoIdScanner = new TMScanner({
-    canvas: document.getElementById('demo-id-canvas'),
-    topLeftEl: document.getElementById('demo-id-topleft'),
-    bottomLeftEl: document.getElementById('demo-id-bottomleft'),
-    modelPath: './id/id_model/',         // <-- your ID model folder
-    facingMode: 'environment',
-    onLock: (info) => {
-      lockedId = info;
-      setStepState(document.getElementById('badge-id'), 'done');
-      document.getElementById('demo-id-scan-again').style.display = 'inline-flex';
-      setStepState(document.getElementById('badge-verify'), 'active');
-      addLog(`✅ ID locked: ${info.className}`, 'success');
-    }
-  });
-  demoIdScanner.start();
-
   // Scan Again buttons
   document.getElementById('demo-face-scan-again').onclick = () => {
+    // Resets entire flow back to Face
     lockedFace = null;
+    lockedId = null;
+    if (demoIdScanner) demoIdScanner.stop();
     setStepState(document.getElementById('badge-face'), 'active');
+    setStepState(document.getElementById('badge-id'), 'pending');
+    setStepState(document.getElementById('badge-verify'), 'pending');
     document.getElementById('demo-face-scan-again').style.display = 'none';
+    document.getElementById('demo-id-scan-again').style.display = 'none';
+    document.getElementById('verify-status').textContent = 'Waiting for face lock…';
     demoFaceScanner.start();
   };
+
   document.getElementById('demo-id-scan-again').onclick = () => {
+    // Only rescan ID (keep face result)
     lockedId = null;
     setStepState(document.getElementById('badge-id'), 'active');
+    setStepState(document.getElementById('badge-verify'), 'pending');
     document.getElementById('demo-id-scan-again').style.display = 'none';
+    document.getElementById('verify-status').textContent = 'Rescanning ID…';
     demoIdScanner.start();
   };
 
-  // Back
+  // Back button
   document.getElementById('btn-demo-back').onclick = () => {
     safeStop(demoFaceScanner);
     safeStop(demoIdScanner);
     show('view-home');
   };
 
-  // Verify
+  // Verify button
   document.getElementById('btn-check-verify').onclick = () => {
     if (!lockedFace || !lockedId) {
-      document.getElementById('verify-status').textContent = 'Lock both Face and ID first.';
+      document.getElementById('verify-status').textContent = 'Both face & ID must be locked!';
       return;
     }
     const faceName = normalizeName(lockedFace.className);
@@ -258,7 +310,7 @@ function startDemoFlow() {
       goVerified(faceName);
     } else {
       alert('Mismatch! Please rescan ID.');
-      // reset only ID step
+      // reset only ID step, keep face
       lockedId = null;
       document.getElementById('demo-id-scan-again').style.display = 'none';
       setStepState(document.getElementById('badge-verify'), 'pending');
@@ -272,7 +324,8 @@ function goVerified(name) {
   safeStop(demoFaceScanner);
   safeStop(demoIdScanner);
   document.getElementById('verified-title').textContent = 'Verified';
-  document.getElementById('verified-text').innerHTML = `The person and ID belong to <strong>${escapeHtml(name.toUpperCase())}</strong>`;
+  document.getElementById('verified-text').innerHTML =
+    `The person and ID belong to <strong>${escapeHtml(name.toUpperCase())}</strong>`;
   show('view-verified');
   addLog(`🎉 Verified: ${name}`, 'success');
 }
@@ -317,7 +370,7 @@ function startSoloId() {
     canvas: document.getElementById('solo-id-canvas'),
     topLeftEl: document.getElementById('solo-id-topleft'),
     bottomLeftEl: document.getElementById('solo-id-bottomleft'),
-    modelPath: './id/id_model/',
+    modelPath: './id_model/',
     facingMode: 'environment',
     onLock: (info) => {
       addLog(`✅ ID locked: ${info.className}`, 'success');
@@ -340,12 +393,12 @@ function startSoloId() {
    App bootstrap
    ======================= */
 document.addEventListener('DOMContentLoaded', () => {
-  // toast animation keyframes for notifications (if you add any)
+  // Tiny animation def for any toasts you might add later
   const style = document.createElement('style');
   style.textContent = `@keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}`;
   document.head.appendChild(style);
 
-  // clock
+  // Clock in logs card
   setInterval(() => {
     const now = new Date();
     const t = document.getElementById('current-time');
